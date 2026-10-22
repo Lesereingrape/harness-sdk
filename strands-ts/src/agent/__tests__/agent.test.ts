@@ -34,6 +34,8 @@ import {
   BeforeToolsEvent,
 } from '../../hooks/events.js'
 import { BedrockModel } from '../../models/bedrock.js'
+import { ModelRouter } from '../../models/routing/router.js'
+import type { Model } from '../../models/model.js'
 import { StructuredOutputError } from '../../errors.js'
 import { expectLoopMetrics } from '../../__fixtures__/metrics-helpers.js'
 import { expectAgentResult } from '../../__fixtures__/agent-helpers.js'
@@ -1378,6 +1380,57 @@ describe('Agent', () => {
     })
   })
 
+  describe('auxModel', () => {
+    it('defaults to model', () => {
+      const model = new MockMessageModel()
+      const agent = new Agent({ model })
+
+      expect(agent.auxModel).toBe(model)
+    })
+
+    it('uses the configured auxModel', () => {
+      const auxModel = new MockMessageModel()
+      const agent = new Agent({ model: new MockMessageModel(), auxModel })
+
+      expect(agent.auxModel).toBe(auxModel)
+    })
+
+    it('creates BedrockModel from a string model id', () => {
+      const agent = new Agent({
+        model: new MockMessageModel(),
+        auxModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      })
+
+      expect(agent.auxModel).toBeInstanceOf(BedrockModel)
+      expect(agent.auxModel.getConfig().modelId).toBe('us.anthropic.claude-haiku-4-5-20251001-v1:0')
+    })
+
+    it('rejects a ModelRouter', () => {
+      const router = new ModelRouter([new MockMessageModel()])
+
+      expect(() => new Agent({ auxModel: router as unknown as Model })).toThrow(/ModelRouter/)
+    })
+
+    it('is reassignable at runtime', () => {
+      const model = new MockMessageModel()
+      const agent = new Agent({ model })
+      const auxModel = new MockMessageModel()
+
+      agent.auxModel = auxModel
+      expect(agent.auxModel).toBe(auxModel)
+
+      agent.auxModel = 'us.anthropic.claude-haiku-4-5-20251001-v1:0'
+      expect(agent.auxModel).toBeInstanceOf(BedrockModel)
+
+      agent.auxModel = undefined
+      expect(agent.auxModel).toBe(model)
+
+      expect(() => {
+        agent.auxModel = new ModelRouter([new MockMessageModel()]) as unknown as Model
+      }).toThrow(/ModelRouter/)
+    })
+  })
+
   describe('model initialization', () => {
     describe('when model is a string', () => {
       it('creates BedrockModel with specified modelId', () => {
@@ -2184,7 +2237,7 @@ describe('normalizeToolUseNames', () => {
     })
 
     describe('when limits.outputTokens is reached', () => {
-      it('returns limitOutputTokens once cumulative outputTokens hits the cap', async () => {
+      it('returns limitOutputTokens once cumulative outputTokens hits the limit', async () => {
         const model = new MockMessageModel()
           .addTurn(...toolUseTurn('tool-1', { inputTokens: 10, outputTokens: 60, totalTokens: 70 }))
           .addTurn(...toolUseTurn('tool-2', { inputTokens: 10, outputTokens: 60, totalTokens: 70 }))
@@ -2210,7 +2263,7 @@ describe('normalizeToolUseNames', () => {
         )
       })
 
-      it('uses at-most (>=) semantics: stops when count exactly equals the cap', async () => {
+      it('uses at-most (>=) semantics: stops when count exactly equals the limit', async () => {
         const model = new MockMessageModel()
           .addTurn(...toolUseTurn('tool-1', { inputTokens: 10, outputTokens: 100, totalTokens: 110 }))
           .addTurn(...toolUseTurn('tool-2', { inputTokens: 10, outputTokens: 100, totalTokens: 110 }))
@@ -2234,7 +2287,7 @@ describe('normalizeToolUseNames', () => {
     })
 
     describe('when limits.totalTokens is reached', () => {
-      it('returns limitTotalTokens once cumulative totalTokens hits the cap', async () => {
+      it('returns limitTotalTokens once cumulative totalTokens hits the limit', async () => {
         const model = new MockMessageModel()
           .addTurn(...toolUseTurn('tool-1', { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
           .addTurn(...toolUseTurn('tool-2', { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
@@ -2318,7 +2371,7 @@ describe('normalizeToolUseNames', () => {
         )
       })
 
-      it('falls back to outputTokens when no higher-priority cap is set', async () => {
+      it('falls back to outputTokens when no higher-priority limit is set', async () => {
         const result = await buildAgent().invoke('go', { limits: { outputTokens: 1 } })
 
         expect(result).toEqual(
@@ -2334,7 +2387,7 @@ describe('normalizeToolUseNames', () => {
     describe('when the same agent is reused across invocations', () => {
       it('scopes the limit to the current invocation, not lifetime', async () => {
         // Each turn uses 50 output tokens. With limits.outputTokens: 75, a single
-        // invocation tolerates one turn but trips on the second. If the cap
+        // invocation tolerates one turn but trips on the second. If the limit
         // were lifetime-scoped, the second `invoke()` would trip on its first
         // turn (75 cumulative across both calls).
         const model = new MockMessageModel()
@@ -2372,11 +2425,11 @@ describe('normalizeToolUseNames', () => {
     })
 
     describe('when a limit key is unrecognized', () => {
-      // Guards #4354: a mistyped cap name is rejected instead of silently applying no limit.
+      // Guards #4354: a mistyped limit name is rejected instead of silently applying no limit.
       it.each([
         ['maxTurns', { limits: { maxTurns: 3 } }],
         ['turn', { limits: { turn: 3 } }],
-        ['a typo alongside a valid cap', { limits: { turns: 3, maxTokens: 100 } }],
+        ['a typo alongside a valid limit', { limits: { turns: 3, maxTokens: 100 } }],
       ])('rejects %s with TypeError', async (_label, options) => {
         const agent = new Agent({ model: new MockMessageModel().addTurn({ type: 'textBlock', text: 'never reached' }) })
         await expect(agent.invoke('go', options as InvokeOptions)).rejects.toThrow(/not recognized/)

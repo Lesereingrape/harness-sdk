@@ -10,6 +10,7 @@ import { normalizeHarnessAgentConfig } from '@strands-agents/harness/internal'
 import { ZipFile } from 'yazl'
 
 import { webFetchModelId } from '../builtin-tools.js'
+import { configuredSkillPaths } from '../skills.js'
 import { PROVIDER_PACKAGES } from '../provider/packages.js'
 import { chooseSaveFile } from '../terminal/directory-picker.js'
 import { agentProjectSource } from './source.js'
@@ -32,18 +33,48 @@ export async function exportAgentProject(
   baseDir = process.cwd(),
   destination?: string
 ): Promise<string | undefined> {
-  const projectName = slug(profile.name)
   const selectedDestination =
     destination ??
     (await chooseSaveFile(
       `Export ${language === 'typescript' ? 'TypeScript' : 'Python'} harness project`,
-      `${projectName}-${language}.zip`
+      exportFileName(profile.name, language)
     ))
   if (!selectedDestination) {
     return undefined
   }
   const path = selectedDestination.toLowerCase().endsWith('.zip') ? selectedDestination : `${selectedDestination}.zip`
   return writeAgentProject(profile, language, skillPaths, path, baseDir, destination === undefined)
+}
+
+export function exportFileName(name: string, language: AgentProjectLanguage): string {
+  return `${slug(name)}-${language}.zip`
+}
+
+/**
+ * Exports the saved setup profile to `destination`, resolved against `cwd`. Agents authored in code keep
+ * their session and memory paths in source, so they export from chat, where those paths are loaded.
+ */
+export async function exportSavedAgent(
+  saved: { profile: HarnessAgentConfig; profileBaseDir?: string | null; agentProject?: string },
+  language: AgentProjectLanguage,
+  destination: string,
+  cwd = process.cwd()
+): Promise<string> {
+  if (saved.agentProject) {
+    throw new Error('This agent is authored in code. Export it from chat with /export.')
+  }
+  const baseDir = saved.profileBaseDir ?? cwd
+  const skills = saved.profile.skills
+  const path = destination.startsWith('~/') ? resolve(homedir(), destination.slice(2)) : resolve(cwd, destination)
+  const zipPath = path.toLowerCase().endsWith('.zip') ? path : `${path}.zip`
+  return writeAgentProject(
+    saved.profile,
+    language,
+    configuredSkillPaths(typeof skills === 'object' ? [...skills] : skills, baseDir),
+    zipPath,
+    baseDir,
+    false
+  )
 }
 
 export async function writeAgentProject(
@@ -133,8 +164,8 @@ export async function exportSourceProject(
     '.env.local',
     '.strands-dependencies',
     AGENT_ENTRYPOINT_FILE,
-    relative(root, path),
-    ...privateDirectories.map((path) => relative(root, path)),
+    posixRelative(root, path),
+    ...privateDirectories.map((path) => posixRelative(root, path)),
   ])
   const entrypoint = resolveProjectEntrypoint(
     root,
@@ -497,10 +528,15 @@ function addPath(
     throw new Error('Exported packages cannot contain symbolic links.')
   }
   if (details.isDirectory()) {
-    addDirectory(zip, source, destination, addBytes, new Set(privatePaths.map((path) => relative(source, path))))
+    addDirectory(zip, source, destination, addBytes, new Set(privatePaths.map((path) => posixRelative(source, path))))
   } else if (details.isFile()) {
     addFile(zip, source, destination, addBytes)
   }
+}
+
+/** Exclusion sets and ZIP entry names are always `/`-separated, so Windows paths have to be normalized. */
+function posixRelative(from: string, to: string): string {
+  return relative(from, to).split(sep).join('/')
 }
 
 function addDirectory(
@@ -518,14 +554,14 @@ function addDirectory(
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       safeComponent(entry.name)
       const path = join(directory, entry.name)
-      if (IGNORED_DIRECTORIES.has(entry.name) || excluded.has(relative(root, path))) {
+      if (IGNORED_DIRECTORIES.has(entry.name) || excluded.has(posixRelative(root, path))) {
         continue
       }
       const details = lstatSync(path)
       if (details.isSymbolicLink()) {
         throw new Error('Exported packages cannot contain symbolic links.')
       }
-      const target = [destination, relative(root, path).split(sep).join('/')].filter(Boolean).join('/')
+      const target = [destination, posixRelative(root, path)].filter(Boolean).join('/')
       if (details.isDirectory()) {
         zip.addEmptyDirectory(target)
         visit(path)

@@ -1,8 +1,11 @@
 """Tests for model validation helper functions."""
 
+import logging
+from collections import Counter
+
 import pytest
 
-from strands.models._validation import _has_location_source, validate_region
+from strands.models._validation import _has_location_source, _log_skipped_blocks, validate_region
 
 
 class TestValidateRegion:
@@ -116,3 +119,19 @@ class TestHasLocationSource:
         """Test that audio without source is not detected as location."""
         content = {"audio": {"format": "wav"}}
         assert not _has_location_source(content)
+
+
+def test_log_skipped_blocks_logs_each_notice_once_with_its_count(caplog):
+    caplog.set_level(logging.WARNING, logger="strands.test")
+
+    _log_skipped_blocks(logging.getLogger("strands.test"), Counter({"notice a": 3, "notice b": 1}))
+
+    assert [record.getMessage() for record in caplog.records] == ["count=<3> | notice a", "count=<1> | notice b"]
+
+
+def test_log_skipped_blocks_logs_nothing_when_nothing_was_skipped(caplog):
+    caplog.set_level(logging.WARNING, logger="strands.test")
+
+    _log_skipped_blocks(logging.getLogger("strands.test"), Counter())
+
+    assert caplog.records == []

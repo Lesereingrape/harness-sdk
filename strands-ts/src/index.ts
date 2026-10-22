@@ -18,7 +18,8 @@ export type { AgentConfig, ToolList, ToolExecutorStrategy } from './agent/agent.
 export type { BackgroundTasksConfig } from './background-tasks/types.js'
 export type { AgentAsToolOptions } from './agent/agent-as-tool.js'
 export type { ToolCaller, ToolCallerProxy, ToolHandle, DirectToolCallOptions } from './agent/tool-caller.js'
-export type { InvocationState, InvokeArgs, InvokeOptions, LocalAgent } from './types/agent.js'
+export type { InvocationState, InvokeArgs, InvokeLimits, InvokeOptions, LocalAgent } from './types/agent.js'
+export type { InvocationContext, InvocationContextUsage } from './agent/invocation-context.js'
 export type { LifecycleObserver } from './types/lifecycle-observer.js'
 
 // Snapshot types
@@ -44,6 +45,7 @@ export {
 } from './errors.js'
 
 // Interrupt system
+export { InterruptError } from './interrupt.js'
 export type { Interrupt, InterruptSource } from './interrupt.js'
 export type { InterruptParams, InterruptResponse, InterruptResponseContentData } from './types/interrupt.js'
 export { InterruptResponseContent } from './types/interrupt.js'
@@ -193,6 +195,17 @@ export type { BaseModelConfig, CountTokensOptions, StreamOptions, CacheConfig } 
 
 export { Model } from './models/model.js'
 
+// Decision models
+export { DecisionModel, defineQuestions, LLMDecisionModel, Uncertain } from './decisions/index.js'
+export type {
+  AnswerOf,
+  AskOptions,
+  DecisionInput,
+  DecisionResult,
+  LLMDecisionModelOptions,
+  Question,
+} from './decisions/index.js'
+
 // Model routing
 export { ClassifierStrategy, FallbackStrategy, ModelRouter, RoutingCandidate } from './models/routing/index.js'
 export type {
@@ -314,7 +327,10 @@ export type { Logger } from './logging/types.js'
 // MCP Client types and implementations
 export {
   type McpClientOptions,
+  type McpListOptions,
   type McpListToolsOptions,
+  type McpProgress,
+  type McpProgressCallback,
   type McpToolFilterCallback,
   type McpToolFilters,
   type McpToolMatcher,
@@ -328,6 +344,8 @@ export {
   type McpServerConfig,
   type SerializableMcpToolFilters,
   McpClient,
+  McpTaskCancelledError,
+  McpTaskFailedError,
 } from './mcp/index.js'
 export type { ElicitationCallback, ElicitationContext } from './types/elicitation.js'
 
@@ -409,3 +427,27 @@ export type {
   IntervalTriggerOptions,
   ModelExtractorOptions,
 } from './memory/index.js'
+
+export type { McpTaskRequestOptions } from './mcp/index.js'
+export type {
+  McpSubmitToolResult,
+  McpCancelTaskResult,
+  McpCancelledTask,
+  McpCompletedTask,
+  McpCreateTaskResult,
+  McpDetailedTask,
+  McpDirectCallToolResult,
+  McpFailedTask,
+  McpGetTaskResult,
+  McpInputRequest,
+  McpInputRequests,
+  McpInputRequiredTask,
+  McpInputResponse,
+  McpInputResponses,
+  McpTask,
+  McpTaskError,
+  McpTaskResult,
+  McpTaskStatus,
+  McpUpdateTaskResult,
+  McpWorkingTask,
+} from './mcp/index.js'

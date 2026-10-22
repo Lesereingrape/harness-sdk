@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
   Message,
@@ -213,17 +213,21 @@ describe('interactive runtime lifecycle', () => {
           kind: 'permissions',
           body: expect.stringContaining('WARNING'),
           rows: [
-            { label: 'Default (HITL)' },
-            { label: 'Bypass', badge: { text: 'Active' } },
+            { label: 'Ask when needed (HITL)' },
+            { label: 'Allow all tools', badge: { text: 'Active' } },
             { label: 'bash', control: { kind: 'toggle', checked: true } },
-            { label: 'write', control: { kind: 'toggle', checked: false } },
+            { label: 'write', control: { kind: 'toggle', checked: true } },
             { label: 'config', description: configPath },
           ],
         },
       })
       const writePermission = controller.getSnapshot().panel?.rows.find((row) => row.label === 'write')
       expect(writePermission).toBeDefined()
-      await controller.activatePanelRow(writePermission!)
+      expect(writePermission?.value).toBeUndefined()
+      await controller.activatePanelRow(controller.getSnapshot().panel!.rows[0]!)
+      const configurableWritePermission = controller.getSnapshot().panel?.rows.find((row) => row.label === 'write')
+      expect(configurableWritePermission?.value).toBeDefined()
+      await controller.activatePanelRow(configurableWritePermission!)
       expect(JSON.parse(await readFile(configPath, 'utf8')).permissions.allow).toEqual(['bash', 'write'])
     } finally {
       await controller.dispose()
@@ -953,10 +957,12 @@ describe('interactive runtime lifecycle', () => {
       const sandbox = secondOptions.sandbox
       expect(sandbox && sandbox !== false).toBe(true)
       const realSecondWorkspace = await realpath(secondWorkspace)
-      await expect(sandbox && sandbox !== false ? sandbox.execute('pwd') : undefined).resolves.toMatchObject({
-        exitCode: 0,
-        stdout: `${realSecondWorkspace}\n`,
-      })
+      const pwd = sandbox && sandbox !== false ? await sandbox.execute('pwd') : undefined
+      expect(pwd).toMatchObject({ exitCode: 0 })
+      // Windows sandboxes run MSYS `sh`, which prints its own mount paths instead of the C:\ path.
+      expect(pwd?.stdout.trim().replaceAll(sep, '/')).toContain(
+        `${basename(dirname(realSecondWorkspace))}/${basename(realSecondWorkspace)}`
+      )
       expect(mocks.loadMcp).toHaveBeenNthCalledWith(2, {
         cwd: secondWorkspace,
         paths: [explicitMcp],

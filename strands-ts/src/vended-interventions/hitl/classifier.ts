@@ -1,5 +1,7 @@
 import { z } from 'zod'
 import { Agent } from '../../agent/agent.js'
+import { createAuxiliaryInvocationContext } from '../../agent/invocation-context.js'
+import type { InvokeOptions } from '../../types/agent.js'
 import type { BeforeToolCallEvent } from '../../hooks/events.js'
 import type { Model } from '../../models/model.js'
 
@@ -24,7 +26,7 @@ export type HumanInTheLoopClassifier = (event: BeforeToolCallEvent) => Classifie
 export interface LlmClassifierConfig {
   /** System prompt describing risk criteria. Defaults to a general-purpose risk prompt. */
   systemPrompt?: string
-  /** Model for risk evaluation. Defaults to the parent agent's model. */
+  /** Model for risk evaluation. Resolution order: `this model > agent.auxModel > agent.model`. */
   model?: Model
 }
 
@@ -72,7 +74,7 @@ export function createLlmRiskClassifier(config?: LlmClassifierConfig): HumanInTh
   const configuredModel = config?.model
 
   return async (event: BeforeToolCallEvent): Promise<ClassifierResult> => {
-    const model = configuredModel ?? event.agent.model
+    const model = configuredModel ?? event.agent.auxModel
     if (!model) {
       throw new Error(
         'LLM risk classifier has no model — pass `model` in `classifier: { model }`, or ensure the parent agent has a model.'
@@ -87,7 +89,11 @@ export function createLlmRiskClassifier(config?: LlmClassifierConfig): HumanInTh
     })
 
     const prompt = `Should this tool call require human approval?\n\nTool: ${event.toolUse.name}\nInput: ${JSON.stringify(event.toolUse.input, null, 2)}`
-    const result = await inner.invoke(prompt)
+    const auxiliaryInvocationContext = createAuxiliaryInvocationContext(event.invocationContext)
+    const invokeOptions: InvokeOptions = {
+      ...(auxiliaryInvocationContext && { invocationContext: auxiliaryInvocationContext }),
+    }
+    const result = await inner.invoke(prompt, invokeOptions)
     const decision = RISK_DECISION.parse(result.structuredOutput)
 
     return {

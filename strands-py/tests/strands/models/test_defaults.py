@@ -16,12 +16,43 @@ class TestGetContextWindowLimit:
         assert get_context_window_limit("anthropic.claude-sonnet-4-6") == 1_000_000
         assert get_context_window_limit("anthropic.claude-haiku-4-5-20251001-v1:0") == 200_000
 
+    def test_known_anthropic_current_generation(self):
+        # Guards against the 1M-context 5.5 / 5.1 models resolving to None (#4692),
+        # which silently disables proactive compression and reports a wrong utilization.
+        assert get_context_window_limit("claude-sonnet-5-5") == 1_000_000
+        assert get_context_window_limit("claude-opus-5-5") == 1_000_000
+        assert get_context_window_limit("claude-fable-5-1") == 1_000_000
+        assert get_context_window_limit("anthropic.claude-sonnet-5-5") == 1_000_000
+        assert get_context_window_limit("anthropic.claude-opus-5-5") == 1_000_000
+        assert get_context_window_limit("anthropic.claude-fable-5-1") == 1_000_000
+        assert get_context_window_limit("global.anthropic.claude-opus-5-5") == 1_000_000
+        assert get_context_window_limit("us.anthropic.claude-fable-5-1") == 1_000_000
+        # Claude Haiku 5.5 has the same 1M window (#4996).
+        assert get_context_window_limit("claude-haiku-5-5") == 1_000_000
+        assert get_context_window_limit("anthropic.claude-haiku-5-5") == 1_000_000
+        assert get_context_window_limit("eu.anthropic.claude-haiku-5-5") == 1_000_000
+        assert get_context_window_limit("global.anthropic.claude-haiku-5-5") == 1_000_000
+
     def test_known_bedrock_nova(self):
         assert get_context_window_limit("amazon.nova-pro-v1:0") == 300_000
         assert get_context_window_limit("amazon.nova-micro-v1:0") == 128_000
 
+    def test_known_bedrock_zai(self):
+        # GLM-5.3 resolves to its 1M window, not the 200K default (#5300).
+        assert get_context_window_limit("zai.glm-4.7") == 203_000
+        assert get_context_window_limit("zai.glm-4.7-flash") == 203_000
+        assert get_context_window_limit("zai.glm-5") == 200_000
+        assert get_context_window_limit("zai.glm-5.3") == 1_000_000
+        assert get_context_window_limit("us.zai.glm-5.3") == 1_000_000
+        assert get_context_window_limit("global.zai.glm-5.3") == 1_000_000
+
     def test_known_openai(self):
         assert get_context_window_limit("gpt-6-astra") == 1_050_000
+        assert get_context_window_limit("gpt-6.1-sol") == 1_050_000
+        assert get_context_window_limit("gpt-6-sol") == 1_050_000
+        assert get_context_window_limit("gpt-6-luna") == 1_050_000
+        assert get_context_window_limit("global.openai.gpt-6.1-sol") == 1_050_000
+        assert get_context_window_limit("us.openai.gpt-6-luna") == 1_050_000
         assert get_context_window_limit("gpt-5.4") == 1_050_000
         assert get_context_window_limit("gpt-4o") == 128_000
         assert get_context_window_limit("o3") == 200_000
