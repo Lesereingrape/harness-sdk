@@ -141,9 +141,9 @@ describe('AnthropicModel', () => {
     })
 
     it('auto-populates contextWindowLimit from model ID lookup', () => {
-      const provider = new AnthropicModel({ apiKey: 'sk-test', modelId: 'claude-sonnet-4-20250514' })
+      const provider = new AnthropicModel({ apiKey: 'sk-test', modelId: 'claude-sonnet-4-6' })
       expect(provider.getConfig()).toStrictEqual({
-        modelId: 'claude-sonnet-4-20250514',
+        modelId: 'claude-sonnet-4-6',
         maxTokens: 64_000,
         contextWindowLimit: 1_000_000,
       })
@@ -161,11 +161,11 @@ describe('AnthropicModel', () => {
     it('does not override explicit contextWindowLimit', () => {
       const provider = new AnthropicModel({
         apiKey: 'sk-test',
-        modelId: 'claude-sonnet-4-20250514',
+        modelId: 'claude-sonnet-4-6',
         contextWindowLimit: 100_000,
       })
       expect(provider.getConfig()).toStrictEqual({
-        modelId: 'claude-sonnet-4-20250514',
+        modelId: 'claude-sonnet-4-6',
         maxTokens: 64_000,
         contextWindowLimit: 100_000,
       })
@@ -194,15 +194,15 @@ describe('AnthropicModel', () => {
       const provider = new AnthropicModel({ apiKey: 'sk-test' })
       expect(provider.getConfig().contextWindowLimit).toBe(1_000_000) // claude-sonnet-4-6 default
 
-      provider.updateConfig({ modelId: 'claude-sonnet-4-20250514' })
-      expect(provider.getConfig().contextWindowLimit).toBe(1_000_000) // claude-sonnet-4-20250514 value
+      provider.updateConfig({ modelId: 'claude-sonnet-4-5-20250929' })
+      expect(provider.getConfig().contextWindowLimit).toBe(200_000) // claude-sonnet-4-5-20250929 value
     })
 
     it('preserves explicit contextWindowLimit when modelId changes', () => {
       const provider = new AnthropicModel({ apiKey: 'sk-test', contextWindowLimit: 50_000 })
       expect(provider.getConfig().contextWindowLimit).toBe(50_000)
 
-      provider.updateConfig({ modelId: 'claude-sonnet-4-20250514' })
+      provider.updateConfig({ modelId: 'claude-sonnet-4-6' })
       expect(provider.getConfig().contextWindowLimit).toBe(50_000) // preserved
     })
   })
@@ -236,6 +236,37 @@ describe('AnthropicModel', () => {
         usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
       })
       expect(events[5]).toEqual({ type: 'modelMessageStopEvent', stopReason: 'endTurn' })
+    })
+
+    it('reports a total that includes cache reads and writes', async () => {
+      // Anthropic reports input_tokens net of the cache, so the four counters sum to the total (#3546).
+      const mockClient = createMockClient(async function* () {
+        yield {
+          type: 'message_start',
+          message: {
+            role: 'assistant',
+            usage: { input_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 50 },
+          },
+        }
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } }
+        yield { type: 'message_stop' }
+      })
+
+      const provider = new AnthropicModel({ client: mockClient })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+      const events = await collectIterator(provider.stream(messages))
+
+      expect(events[1]).toEqual({
+        type: 'modelMetadataEvent',
+        usage: {
+          inputTokens: 5,
+          outputTokens: 7,
+          totalTokens: 162,
+          cacheReadInputTokens: 100,
+          cacheWriteInputTokens: 50,
+        },
+      })
     })
 
     it('handles tool use events', async () => {
@@ -341,8 +372,60 @@ describe('AnthropicModel', () => {
 
       expect(events).toContainEqual({
         type: 'modelContentBlockDeltaEvent',
-        delta: { type: 'reasoningContentDelta', redactedContent: 'data' },
+        delta: { type: 'reasoningContentDelta', redactedContent: new Uint8Array([117, 171, 90]) },
       })
+    })
+
+    // Regression for #4587: redacted thinking data arrives as a base64 string and must
+    // reach the next request as that verbatim string across any toJSON/fromJSON round-trip
+    // (Message.clone(), session save/restore).
+    it('preserves redacted thinking data through stream, serialization, and request round-trips', async () => {
+      const redactedData = 'EmwKAgIBc2VjcmV0LWRhdGE='
+      const decodedBytes = new Uint8Array([18, 108, 10, 2, 2, 1, 115, 101, 99, 114, 101, 116, 45, 100, 97, 116, 97])
+
+      const mockClient = createMockClient(async function* () {
+        yield { type: 'message_start', message: { role: 'assistant', usage: { input_tokens: 10 } } }
+        yield {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'redacted_thinking', data: redactedData },
+        }
+        yield { type: 'content_block_stop', index: 0 }
+        yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }
+        yield { type: 'message_stop' }
+      })
+
+      const provider = new AnthropicModel({ client: mockClient })
+      const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+      const aggregated = (await collectGenerator(provider.streamAggregated(messages))).result
+      const streamedBlock = aggregated.message.content[0] as ReasoningBlock
+
+      // The streamed block holds the decoded bytes its declared type promises
+      expect(streamedBlock.type).toBe('reasoningBlock')
+      expect(streamedBlock.redactedContent).toEqual(decodedBytes)
+
+      // Session save/restore (toJSON/fromJSON) must not alter the value
+      const restored = Message.fromJSON(JSON.parse(JSON.stringify(aggregated.message)))
+      const restoredBlock = restored.content[0] as ReasoningBlock
+      expect(restoredBlock.redactedContent).toEqual(decodedBytes)
+
+      // Sending the restored block back must carry the verbatim base64 string
+      const captured: { request: any } = { request: null }
+      const captureClient = {
+        messages: {
+          stream: vi.fn((req: any) => {
+            captured.request = req
+            return (async function* () {
+              yield { type: 'ping' }
+            })()
+          }),
+        },
+      } as unknown as Anthropic
+      const sendBack = new AnthropicModel({ client: captureClient })
+      await collectIterator(sendBack.stream([restored]))
+
+      expect(captured.request.messages[0].content).toEqual([{ type: 'redacted_thinking', data: redactedData }])
     })
 
     it('handles text payload directly in content_block_start (optimization)', async () => {
@@ -424,6 +507,150 @@ describe('AnthropicModel', () => {
 
       await expect(collectIterator(provider.stream(messages))).rejects.toThrow(ModelThrottledError)
       await expect(collectIterator(provider.stream(messages))).rejects.toThrow('Rate limit exceeded')
+    })
+  })
+
+  describe('stale thinking recovery', () => {
+    const bindingMessage =
+      '400 messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.'
+    const bindingError = Object.assign(new Error(bindingMessage), { status: 400 })
+    const dropBlockThinking = { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } }
+    const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
+
+    const createRejectingOnceClient = (error: Error = bindingError, retryError?: Error) => {
+      let calls = 0
+      const stream = vi.fn(() =>
+        (async function* () {
+          calls += 1
+          if (calls === 1) throw error
+          if (retryError) throw retryError
+          yield { type: 'message_start', message: { role: 'assistant', usage: {} } }
+        })()
+      )
+      return { stream, client: { messages: { stream } } as unknown as Anthropic }
+    }
+
+    it('retries once with drop_block and keeps it on for later requests', async () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const { stream, client } = createRejectingOnceClient()
+      const provider = new AnthropicModel({
+        client,
+        modelId: 'm1',
+        betas: ['other-beta'],
+        params: { thinking: { type: 'adaptive' } },
+      })
+
+      const events = await collectIterator(provider.stream(messages))
+
+      expect(events[0]).toStrictEqual({ type: 'modelMessageStartEvent', role: 'assistant' })
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retrying with drop_block'))
+      const expectedOptions = { headers: { 'anthropic-beta': 'other-beta,thinking-binding-controls-2026-08-01' } }
+      expect(stream.mock.calls.map((call: unknown[]) => [(call[0] as any).thinking, call[1]])).toStrictEqual([
+        [{ type: 'adaptive' }, { headers: { 'anthropic-beta': 'other-beta' } }],
+        [dropBlockThinking, expectedOptions],
+      ])
+
+      await collectIterator(provider.stream(messages))
+
+      expect(stream).toHaveBeenCalledTimes(3)
+      expect(stream).toHaveBeenLastCalledWith(expect.objectContaining({ thinking: dropBlockThinking }), expectedOptions)
+      warnSpy.mockRestore()
+    })
+
+    it.each([
+      { name: 'a record', defaultHeaders: { 'anthropic-beta': 'client-beta' }, betas: 'client-beta,' },
+      { name: 'a record with a list value', defaultHeaders: { 'Anthropic-Beta': ['a', 'b'] }, betas: 'a,b,' },
+      {
+        name: 'a Headers instance',
+        defaultHeaders: new Headers({ 'anthropic-beta': 'client-beta' }),
+        betas: 'client-beta,',
+      },
+      { name: 'header tuples', defaultHeaders: [['anthropic-beta', 'client-beta']], betas: 'client-beta,' },
+      { name: 'an undefined value', defaultHeaders: { 'anthropic-beta': undefined }, betas: '' },
+      { name: 'a null value', defaultHeaders: { 'anthropic-beta': null }, betas: '' },
+    ])('keeps betas from client default headers given as $name on the retry', async ({ defaultHeaders, betas }) => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const { stream, client } = createRejectingOnceClient()
+      vi.mocked(Anthropic).mockImplementationOnce(function () {
+        return client
+      })
+      const provider = new AnthropicModel({
+        apiKey: 'sk-test',
+        clientConfig: { defaultHeaders },
+        modelId: 'm1',
+        params: { thinking: { type: 'adaptive' } },
+      })
+
+      await collectIterator(provider.stream(messages))
+
+      expect(stream).toHaveBeenLastCalledWith(expect.objectContaining({ thinking: dropBlockThinking }), {
+        headers: { 'anthropic-beta': `${betas}thinking-binding-controls-2026-08-01` },
+      })
+      warnSpy.mockRestore()
+    })
+
+    it.each([
+      {
+        name: 'a throttle',
+        retryError: Object.assign(new Error('Rate limit exceeded'), { status: 429 }),
+        expected: ModelThrottledError,
+      },
+      {
+        name: 'a context window overflow',
+        retryError: Object.assign(new Error('prompt is too long'), { status: 400 }),
+        expected: ContextWindowOverflowError,
+      },
+    ])('maps $name on the retry to its SDK error', async ({ retryError, expected }) => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const { stream, client } = createRejectingOnceClient(bindingError, retryError)
+      const provider = new AnthropicModel({ client, modelId: 'm1', params: { thinking: { type: 'adaptive' } } })
+
+      await expect(collectIterator(provider.stream(messages))).rejects.toThrow(expected)
+      expect(stream).toHaveBeenCalledTimes(2)
+      warnSpy.mockRestore()
+    })
+
+    it('re-throws a second binding error without retrying again', async () => {
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const { stream, client } = createRejectingOnceClient(bindingError, bindingError)
+      const provider = new AnthropicModel({ client, modelId: 'm1', params: { thinking: { type: 'adaptive' } } })
+
+      await expect(collectIterator(provider.stream(messages))).rejects.toThrow('bound to a different conversation')
+      expect(stream).toHaveBeenCalledTimes(2)
+      warnSpy.mockRestore()
+    })
+
+    it.each([
+      {
+        name: 'a caller-set block_binding',
+        params: { thinking: { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'error' } } },
+      },
+      { name: 'no thinking config', params: undefined },
+    ])('re-throws the binding error with $name', async ({ params }) => {
+      const { stream, client } = createRejectingOnceClient()
+      const provider = new AnthropicModel({ client, modelId: 'm1', ...(params && { params }) })
+
+      await expect(collectIterator(provider.stream(messages))).rejects.toThrow('bound to a different conversation')
+      expect(stream).toHaveBeenCalledOnce()
+    })
+
+    it('re-throws the binding message on a non-400 error', async () => {
+      const { stream, client } = createRejectingOnceClient(Object.assign(new Error(bindingMessage), { status: 500 }))
+      const provider = new AnthropicModel({ client, modelId: 'm1', params: { thinking: { type: 'adaptive' } } })
+
+      await expect(collectIterator(provider.stream(messages))).rejects.toThrow('bound to a different conversation')
+      expect(stream).toHaveBeenCalledOnce()
+    })
+
+    it('stops dropping stale thinking after the model changes', async () => {
+      const { stream, client } = createRejectingOnceClient()
+      const provider = new AnthropicModel({ client, modelId: 'm1', params: { thinking: { type: 'adaptive' } } })
+      await collectIterator(provider.stream(messages))
+
+      provider.updateConfig({ modelId: 'm2' })
+      await collectIterator(provider.stream(messages))
+
+      expect(stream).toHaveBeenLastCalledWith(expect.objectContaining({ thinking: { type: 'adaptive' } }))
     })
   })
 
@@ -2445,7 +2672,7 @@ describe('AnthropicModel', () => {
         usage: {
           inputTokens: 11768,
           outputTokens: 115,
-          totalTokens: 11883,
+          totalTokens: 11990,
           cacheReadInputTokens: 100,
           cacheWriteInputTokens: 7,
         },

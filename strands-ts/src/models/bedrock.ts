@@ -30,6 +30,7 @@ import {
   type ReasoningContentBlockDelta,
   type Tool,
   type ToolConfiguration,
+  type TokenUsage as BedrockTokenUsage,
   type ToolUseBlockDelta,
   type AudioSource as BedrockAudioSource,
   type ImageSource as BedrockImageSource,
@@ -58,16 +59,18 @@ import {
   resolveCacheSection,
   resolveConfigMetadata,
 } from '../models/model.js'
-import type { ContentBlock, Message, StopReason, ToolUseBlock } from '../types/messages.js'
+import { THINKING_BINDING_BETA, isThinkingBindingError, thinkingWithDropBlock } from './thinking-binding.js'
+import type { ContentBlock, Message, ReasoningBlock, StopReason, ToolUseBlock } from '../types/messages.js'
 import type { AudioSource, ImageSource, VideoSource, DocumentSource } from '../types/media.js'
 import type { CitationsDelta, ModelStreamEvent, ReasoningContentDelta, Usage } from '../models/streaming.js'
 import type { Citation, CitationLocation, CitationsBlockData } from '../types/citations.js'
-import type { JSONValue } from '../types/json.js'
+import type { JSONSchema, JSONValue } from '../types/json.js'
 import { ContextWindowOverflowError, ModelThrottledError, ProviderTokenCountError, normalizeError } from '../errors.js'
 import { ensureDefined } from '../types/validation.js'
 import { logger } from '../logging/logger.js'
 import { warnOnce } from '../logging/warn-once.js'
 import { NOOP_TOOL_SPEC } from '../tools/noop-tool.js'
+import { ensureStrictJsonSchema, findUnsupportedStrictKeywords } from './strict-schema.js'
 import { MODEL_DEFAULTS, defaultModelWarningMessage } from './defaults.js'
 
 const DEFAULT_BEDROCK_REGION_SUPPORTS_FIP = false
@@ -92,6 +95,28 @@ const MODELS_INCLUDE_STATUS = ['anthropic.claude']
  * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
  */
 const MODELS_SUPPORTING_ANTHROPIC_CACHING = ['anthropic', 'claude']
+
+/**
+ * Models that reject any reasoning text block replayed in history
+ * ("User messages cannot contain reasoning content").
+ */
+const MODELS_REJECT_REASONING_TEXT = [
+  'amazon.nova-lite',
+  'amazon.nova-pro',
+  'google.gemma',
+  'meta.llama',
+  'mistral.devstral',
+  'mistral.ministral',
+  'mistral.mistral-large',
+  'nvidia.nemotron-nano-9b',
+  'nvidia.nemotron-super',
+  'openai.gpt-5',
+  'openai.gpt-6',
+  'qwen.qwen3-235b',
+  'qwen.qwen3-coder',
+  'writer.palmyra',
+  'xai.grok',
+]
 
 /**
  * Error messages that indicate context window overflow.
@@ -316,6 +341,24 @@ export interface BedrockModelConfig extends BaseModelConfig {
    * @defaultValue false
    */
   useNativeTokenCount?: boolean
+
+  /**
+   * Constrain the model to emit tool names and inputs that conform to each tool's schema.
+   *
+   * When `true`, every tool is sent with `strict: true` and a copy of its `inputSchema` with
+   * `additionalProperties: false` added to each object type, so a free-form `{ type: 'object' }`
+   * parameter becomes one the model can only fill with `{}`. Bedrock rejects schemas that use
+   * features outside its strict subset (recursive or external `$ref`, `minimum`/`maximum`/
+   * `multipleOf`, `minLength`/`maxLength`, `additionalProperties` other than `false`) with a 400
+   * at request time, and compiles each new schema on first use, which can take minutes.
+   * Incompatible with citations for Anthropic models.
+   *
+   * @see https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html
+   * @see https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolSpecification.html
+   *
+   * @defaultValue false
+   */
+  strictTools?: boolean
 }
 
 /**
@@ -384,6 +427,7 @@ export interface BedrockModelOptions extends BedrockModelConfig {
 export class BedrockModel extends Model<BedrockModelConfig> {
   private _config: BedrockModelConfig
   private _client: BedrockRuntimeClient
+  private _dropStaleThinkingModelId: string | undefined
 
   /**
    * Clears the cache of model IDs for which CountTokens is skipped.
@@ -686,10 +730,12 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       const request = this._formatRequest(messages, options)
       if (this._config.stream !== false) {
         // Create and send the command
-        const command = new ConverseStreamCommand(request)
-        const response = options?.cancelSignal
-          ? await this._client.send(command, { abortSignal: options.cancelSignal })
-          : await this._client.send(command)
+        const response = await this._send(request, (input) => {
+          const command = new ConverseStreamCommand(input)
+          return options?.cancelSignal
+            ? this._client.send(command, { abortSignal: options.cancelSignal })
+            : this._client.send(command)
+        })
         // Stream the response
         if (response.stream) {
           let lastStopReason: string | undefined
@@ -731,10 +777,12 @@ export class BedrockModel extends Model<BedrockModelConfig> {
           }
         }
       } else {
-        const command = new ConverseCommand(request)
-        const response = options?.cancelSignal
-          ? await this._client.send(command, { abortSignal: options.cancelSignal })
-          : await this._client.send(command)
+        const response = await this._send(request, (input) => {
+          const command = new ConverseCommand(input)
+          return options?.cancelSignal
+            ? this._client.send(command, { abortSignal: options.cancelSignal })
+            : this._client.send(command)
+        })
         for (const event of this._mapBedrockEventToSDKEvent(response)) {
           yield event
         }
@@ -749,6 +797,35 @@ export class BedrockModel extends Model<BedrockModelConfig> {
 
       // Re-throw other errors as-is
       throw error
+    }
+  }
+
+  /**
+   * Sends the request, retrying once with drop_block when an edit before replayed thinking made it stale.
+   *
+   * The retry turns drop_block on for every later request to this model, since the stale blocks stay in history.
+   *
+   * @param request - Formatted Bedrock request
+   * @param send - Sends a request to the Converse or ConverseStream API
+   * @returns The API response
+   */
+  private async _send<T>(
+    request: ConverseStreamCommandInput,
+    send: (input: ConverseStreamCommandInput) => Promise<T>
+  ): Promise<T> {
+    try {
+      return await send(request)
+    } catch (error) {
+      const isBindingError =
+        error instanceof Error && error.name === 'ValidationException' && isThinkingBindingError(error)
+      const retryFields = isBindingError ? fieldsWithDropBlock(request.additionalModelRequestFields) : undefined
+      if (!retryFields) throw error
+
+      logger.warn(
+        `model_id=<${request.modelId}> | history edit invalidated replayed thinking blocks, retrying with drop_block`
+      )
+      this._dropStaleThinkingModelId = request.modelId
+      return send({ ...request, additionalModelRequestFields: retryFields })
     }
   }
 
@@ -793,13 +870,18 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     }
 
     if (toolSpecs.length > 0) {
+      const strictTools = this._config.strictTools === true
       const tools: Tool[] = toolSpecs.map(
         (spec) =>
           ({
             toolSpec: {
               name: spec.name,
               description: spec.description,
-              inputSchema: { json: spec.inputSchema },
+              inputSchema: {
+                json:
+                  strictTools && spec.inputSchema ? toStrictInputSchema(spec.name, spec.inputSchema) : spec.inputSchema,
+              },
+              ...(strictTools ? { strict: true } : {}),
             },
           }) as Tool
       )
@@ -890,7 +972,7 @@ export class BedrockModel extends Model<BedrockModelConfig> {
 
     const toolChoice = options?.toolChoice
     if (!toolChoice || 'auto' in toolChoice) {
-      return fields
+      return this._dropStaleThinkingModelId === this._config.modelId ? (fieldsWithDropBlock(fields) ?? fields) : fields
     }
 
     const { thinking: _, ...rest } = fields
@@ -910,9 +992,16 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       ? this._findLastUserTextMessageIndex(messages)
       : undefined
 
+    let droppedReasoningContent = false
+
     const formattedMessages = messages.reduce<BedrockMessage[]>((acc, message, idx) => {
       const shouldApplyGuardBlocks = idx === lastUserTextIdx
       const content = message.content
+        .filter((block: ContentBlock) => {
+          if (block.type !== 'reasoningBlock' || !this._rejectsReasoningBlock(block)) return true
+          droppedReasoningContent = true
+          return false
+        })
         .map((block: ContentBlock) => {
           const formattedBlock = this._formatContentBlock(block)
           return shouldApplyGuardBlocks ? this._applyGuardBlocks(formattedBlock) : formattedBlock
@@ -926,6 +1015,12 @@ export class BedrockModel extends Model<BedrockModelConfig> {
       return acc
     }, [])
 
+    if (droppedReasoningContent) {
+      logger.debug(
+        `model_id=<${this._config.modelId ?? MODEL_DEFAULTS.bedrock.modelId}> | dropped reasoningContent blocks the model does not accept`
+      )
+    }
+
     const cacheConfig = this._config.cacheConfig
     const messagesCache = this._shouldEnableCaching()
       ? resolveCacheSection(cacheConfig?.messagesTTL, cacheConfig?.ttl)
@@ -935,6 +1030,30 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     }
 
     return formattedMessages
+  }
+
+  /**
+   * Whether the configured model would reject this reasoning block if it were replayed.
+   *
+   * Only blocks that are certain to fail are dropped. `signature` is Anthropic-only: Anthropic models reject
+   * reasoning text without one and every other model rejects reasoning text with one. Models in
+   * `MODELS_REJECT_REASONING_TEXT` reject reasoning text outright and DeepSeek rejects any reasoning block.
+   * `redactedContent` is otherwise opaque and kept, as is every block when the model ID is an ARN or bare
+   * inference profile ID that names no vendor.
+   *
+   * @param block - Reasoning block replayed from message history
+   * @returns True if the block must be dropped from the request
+   */
+  private _rejectsReasoningBlock(block: ReasoningBlock): boolean {
+    const modelId = (this._config.modelId ?? MODEL_DEFAULTS.bedrock.modelId).toLowerCase()
+    if (modelId.includes('deepseek')) return true
+    if (block.text === undefined && block.signature === undefined) return false
+
+    const signed = Boolean(block.signature)
+    if (modelId.includes('anthropic') || modelId.includes('claude')) return !signed
+    if (modelId.startsWith('arn:') || !modelId.includes('.')) return false
+    if (MODELS_REJECT_REASONING_TEXT.some((model) => modelId.includes(model))) return true
+    return signed
   }
 
   /**
@@ -1518,6 +1637,25 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     }
   }
 
+  /**
+   * Maps a Bedrock `TokenUsage` to the SDK's `Usage`. Shared by the streaming and non-streaming
+   * paths so the cache counters they surface cannot drift apart.
+   */
+  private _mapBedrockUsage(usage: BedrockTokenUsage): Usage {
+    const mapped: Usage = {
+      inputTokens: ensureDefined(usage.inputTokens, 'usage.inputTokens'),
+      outputTokens: ensureDefined(usage.outputTokens, 'usage.outputTokens'),
+      totalTokens: ensureDefined(usage.totalTokens, 'usage.totalTokens'),
+    }
+    if (usage.cacheReadInputTokens !== undefined) {
+      mapped.cacheReadInputTokens = usage.cacheReadInputTokens
+    }
+    if (usage.cacheWriteInputTokens !== undefined) {
+      mapped.cacheWriteInputTokens = usage.cacheWriteInputTokens
+    }
+    return mapped
+  }
+
   private _mapBedrockEventToSDKEvent(event: ConverseCommandOutput): ModelStreamEvent[] {
     const events: ModelStreamEvent[] = []
 
@@ -1613,11 +1751,7 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     const usage = ensureDefined(event.usage, 'output.usage')
     const metadataEvent: ModelStreamEvent = {
       type: 'modelMetadataEvent',
-      usage: {
-        inputTokens: ensureDefined(usage.inputTokens, 'usage.inputTokens'),
-        outputTokens: ensureDefined(usage.outputTokens, 'usage.outputTokens'),
-        totalTokens: ensureDefined(usage.totalTokens, 'usage.totalTokens'),
-      },
+      usage: this._mapBedrockUsage(usage),
     }
 
     if (event.metrics) {
@@ -1796,22 +1930,7 @@ export class BedrockModel extends Model<BedrockModelConfig> {
         }
 
         if (data.usage) {
-          const usage = data.usage
-
-          const usageInfo: Usage = {
-            inputTokens: ensureDefined(usage.inputTokens, 'usage.inputTokens'),
-            outputTokens: ensureDefined(usage.outputTokens, 'usage.outputTokens'),
-            totalTokens: ensureDefined(usage.totalTokens, 'usage.totalTokens'),
-          }
-
-          if (usage.cacheReadInputTokens !== undefined) {
-            usageInfo.cacheReadInputTokens = usage.cacheReadInputTokens
-          }
-          if (usage.cacheWriteInputTokens !== undefined) {
-            usageInfo.cacheWriteInputTokens = usage.cacheWriteInputTokens
-          }
-
-          event.usage = usageInfo
+          event.usage = this._mapBedrockUsage(data.usage)
         }
 
         if (data.metrics) {
@@ -1953,7 +2072,9 @@ export class BedrockModel extends Model<BedrockModelConfig> {
     return {
       location: this._mapCitationLocationToBedrock(citation.location),
       sourceContent: citation.sourceContent.map((sc) => ({ text: sc.text })),
-      source: citation.source,
+      // An empty source marks one Bedrock never returned (e.g. document citations), and Bedrock
+      // rejects `source` on those locations while requiring it on search-result locations.
+      ...(citation.source && { source: citation.source }),
       title: citation.title,
     }
   }
@@ -2055,7 +2176,38 @@ export class BedrockModel extends Model<BedrockModelConfig> {
 }
 
 /**
- * Merges a request timeout into the caller's requestHandler options.
+ * Return additional request fields that drop stale thinking blocks, or undefined if they cannot change.
+ *
+ * @param fields - The additional model request fields
+ * @returns The fields with drop_block and its beta, or undefined
+ */
+function fieldsWithDropBlock(fields: JSONValue | undefined): Record<string, JSONValue> | undefined {
+  if (typeof fields !== 'object' || fields === null || Array.isArray(fields)) return undefined
+  const thinking = thinkingWithDropBlock(fields.thinking)
+  if (!thinking) return undefined
+  const betas = Array.isArray(fields.anthropic_beta) ? fields.anthropic_beta : []
+  const anthropicBeta = betas.includes(THINKING_BINDING_BETA) ? betas : [...betas, THINKING_BINDING_BETA]
+  return { ...fields, anthropic_beta: anthropicBeta, thinking }
+}
+
+/**
+ * Return the strict-mode copy of a tool's input schema, warning once per tool when it still uses
+ * keywords Bedrock's strict mode rejects.
+ */
+function toStrictInputSchema(toolName: string, inputSchema: JSONSchema): JSONSchema {
+  const strictSchema = ensureStrictJsonSchema(inputSchema)
+  const unsupported = findUnsupportedStrictKeywords(strictSchema)
+  if (unsupported.length > 0) {
+    warnOnce(
+      logger,
+      `tool=<${toolName}>, keywords=<${unsupported.join(',')}> | tool schema uses keywords bedrock strict mode rejects, request may fail`
+    )
+  }
+  return strictSchema
+}
+
+/**
+ * Merges a default request timeout into the caller's requestHandler options.
  *
  * The SDK's `requestHandler` slot accepts either a constructed handler instance
  * or an options bag that the SDK uses to build its default handler. We only

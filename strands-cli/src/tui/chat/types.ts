@@ -221,6 +221,7 @@ export interface ChatConversation {
 
 export interface ChatForkState {
   messages: readonly Message[]
+  stash?: Record<string, JSONValue>
   model: string
   thinking: string | boolean | null
   backgroundTasksWaitForCompletion: boolean
@@ -261,6 +262,7 @@ export interface ChatBackend {
   streamShell?(command: string): AsyncGenerator<ChatEvent, ChatRunResult, undefined>
   queueSteering?(prompt: string): boolean
   forkState?(): ChatForkState
+  forkStash?(): Promise<Record<string, JSONValue> | undefined>
   captureConversation?(): Promise<Snapshot>
   sourceSelection?(): ChatConversation['sourceSelection']
   watchTasks?(listener: (tasks: readonly ChatTask[]) => void): () => void
@@ -271,7 +273,8 @@ export interface ChatBackend {
   removeAllowedPermission?(toolName: string): Promise<void>
   backgroundTasksWaitForCompletion?(): boolean | undefined
   setBackgroundTasksWaitForCompletion?(waitForCompletion: boolean): Promise<void>
-  compact?(): Promise<boolean>
+  /** Summarizes older conversation context and returns the new context usage, or undefined when nothing changed. */
+  compact?(): Promise<ChatContextUsage | undefined>
   clear?(): Promise<void>
   hasReadyBackgroundResults?(): boolean
   streamBackgroundResults?(): AsyncGenerator<ChatEvent, ChatRunResult, undefined>
@@ -383,6 +386,7 @@ export interface ChatPanel {
     | 'skills'
     | 'mcp'
     | 'agents'
+    | 'rename'
     | 'permissions'
     | 'tools'
     | 'settings'
@@ -517,6 +521,7 @@ export interface ChatControllerApi {
   dispose(): Promise<void>
   dismissPanel(): boolean
   activatePanelRow(row: ChatPanelRow): Promise<boolean>
+  openSkillDetail(name: string): boolean
   openModelPanel(): Promise<void>
   openContextPanel(): void
 }

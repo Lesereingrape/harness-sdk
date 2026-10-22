@@ -20,7 +20,8 @@ import {
 } from './presentation.js'
 import { AgentsPanel } from './agents-panel.js'
 import { ExportPanel } from './export-panel.js'
-import { EffortSlider, ModelPicker } from './model-panel.js'
+import { ModelPicker } from './model-panel.js'
+import { RenamePanel } from './rename-panel.js'
 import { SessionsPanel } from './sessions-panel.js'
 import { PanelItemHeader, PanelOverlay, PanelTitle } from './panel-components.js'
 import { SettingsControl, SettingsPanel } from './settings-panel.js'
@@ -74,7 +75,6 @@ export function ResourcePanel({
   onFilterElement,
   onSearchElement,
   onSliderElement,
-  commandDeckHeight,
 }: {
   panel: ChatPanel
   context: ChatContextUsage
@@ -102,7 +102,6 @@ export function ResourcePanel({
   onFilterElement?: (id: string, element: DOMElement | null) => void
   onSearchElement?: (element: DOMElement | null) => void
   onSliderElement?: (element: DOMElement | null) => void
-  commandDeckHeight?: number
 }): ReactElement {
   const palette = useTheme()
   const { surface, warning, selection, accent } = palette
@@ -117,15 +116,17 @@ export function ResourcePanel({
           ? 112
           : panel.kind === 'agents'
             ? 112
-            : checklist
-              ? 96
-              : panel.kind === 'context' || panel.kind === 'effort'
-                ? 52
-                : panel.kind === 'permission' && panel.diff
-                  ? 100
-                  : panel.kind === 'permission' || panel.kind === 'error'
-                    ? 68
-                    : 84
+            : panel.kind === 'rename'
+              ? 60
+              : checklist
+                ? 96
+                : panel.kind === 'context'
+                  ? 52
+                  : panel.kind === 'permission' && panel.diff
+                    ? 100
+                    : panel.kind === 'permission' || panel.kind === 'error'
+                      ? 68
+                      : 84
   const width = Math.max(1, Math.min(preferredWidth, terminalWidth - 4))
   const color = panel.kind === 'error' ? 'red' : accent
 
@@ -228,34 +229,6 @@ export function ResourcePanel({
       />
     )
   }
-  if (panel.kind === 'effort' && panel.slider) {
-    const [modelName = '', modelId = ''] = panel.body?.split('\n') ?? []
-    return (
-      <PanelOverlay
-        width={width}
-        {...(commandDeckHeight !== undefined ? { bottomOffset: commandDeckHeight + 1 } : {})}
-        {...(onPanelElement ? { onElement: onPanelElement } : {})}
-      >
-        <Box flexDirection="column" alignItems="center" overflow="hidden">
-          <Text bold color={accent} wrap="truncate-end">
-            Reasoning effort
-          </Text>
-          <Text dimColor wrap="truncate-end">
-            {modelName || modelId}
-          </Text>
-          <EffortSlider
-            slider={panel.slider}
-            width={Math.max(18, Math.min(36, width - 8))}
-            compact={false}
-            pressed={pressedSlider}
-            {...(hoveredSlider !== undefined ? { hovered: hoveredSlider } : {})}
-            focused
-            {...(onSliderElement ? { onElement: onSliderElement } : {})}
-          />
-        </Box>
-      </PanelOverlay>
-    )
-  }
   if (panel.kind === 'context') {
     const used = context.projectedTokens ?? context.currentTokens
     return (
@@ -318,6 +291,17 @@ export function ResourcePanel({
   if (panel.kind === 'agents') {
     return (
       <AgentsPanel {...rowProps} height={Math.max(5, terminalHeight - 8)} columns={agentGridColumns(terminalWidth)} />
+    )
+  }
+  if (panel.kind === 'rename') {
+    return (
+      <RenamePanel
+        panel={panel}
+        value={query}
+        width={width}
+        animateCursor={settings.animations}
+        {...(onPanelElement ? { onPanelElement } : {})}
+      />
     )
   }
   if (panel.kind === 'export') {
